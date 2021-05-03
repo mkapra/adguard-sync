@@ -4,7 +4,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="adguard-sync-mkapra", # Replace with your own username
+    name="adguard-sync", # Replace with your own username
     version="1.0",
     author="Maximilian Kapra",
     author_email="maximilian@kapra.de",
