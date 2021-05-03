@@ -1,7 +1,8 @@
 import sys
+import threading
+
 import yaml
 import json
-import _thread
 import logging
 import requests as re
 from dataclasses import dataclass, field
@@ -20,20 +21,32 @@ class Record:
     address: str
 
 
-class Adguard:
+class Adguard(threading.Thread):
     """
     Instance of adguard
     """
     url: str
     username: str
     password: str
+    config_records: list[Record]
     verify_ssl: bool = field(default=True)
 
-    def __init__(self, url: str, username: str, password: str, verify_ssl: bool = True):
+    def __init__(self, url: str, username: str, password: str, config_records: list[Record], verify_ssl: bool = True):
+        super().__init__()
+
         self.url = url
         self.username = username
         self.password = password
+        self.config_records = config_records
         self.verify_ssl = verify_ssl
+
+    def run(self) -> None:
+        create, delete = self.check_dns_records()
+        self.delete_records(delete)
+        self.create_records(create)
+        
+    def debug(self, msg: str):
+        AdguardSync.debug(self, msg)
 
     def act_on_records(self, records: list[Record], create=True) -> None:
         """
@@ -80,6 +93,56 @@ class Adguard:
         """
         self.act_on_records(records=to_be_created)
 
+    def check_dns_records(self) -> list[list[Record], list[Record]]:
+        """
+        Checks whether a record has to be deleted, edited or created
+
+        :return: two lists of records to be deleted and created
+        """
+        to_be_deleted: list[Record] = []
+        to_be_created: list[Record] = []
+
+        req = re.get(f"{self.url}/control/rewrite/list",
+                     auth=(self.username, self.password), verify=self.verify_ssl)
+
+        if req.status_code != 200:
+            logging.error(f"Could not connect to {self.url}. Code: {req.status_code}")
+            return [[], []]
+
+        adguard_records: dict[str: str, str: str] = req.json()
+
+        # Check which records are on adguard only. They should get deleted also
+        for adguard_record in adguard_records:
+            record = Record(name=adguard_record["domain"], address=adguard_record["answer"])
+            if record not in self.config_records:
+                self.debug(f"Record {record.name} not found. Will be deleted...")
+                to_be_deleted.append(record)
+
+        for config_record in self.config_records:
+            self.debug(f"--- Checking {config_record.name}")
+            found = False
+            changed = False
+
+            for adguard_record in adguard_records:
+                if adguard_record["domain"] == config_record.name:
+                    found = True
+                    if adguard_record["answer"] != config_record.address:
+                        self.debug(f"Need to change {adguard_record['answer']} to "
+                                   f"{config_record.address}")
+                        changed = True
+                        to_be_deleted.append(Record(name=config_record.name, address=adguard_record['answer']))
+                        to_be_created.append(config_record)
+
+                    break
+
+            if found and not changed:
+                self.debug("Correct record already exists")
+            elif not found:
+                self.debug("Record is missing. Will be created.")
+                to_be_created.append(config_record)
+
+        return [to_be_created, to_be_deleted]
+
 
 class AdguardSync:
     # All adguards
@@ -121,68 +184,17 @@ class AdguardSync:
         :param configuration:
         """
 
+        for record in configuration["dns_records"]:
+            self.config_records.append(Record(name=record['domain'], address=record['address']))
+
         for adguard in configuration["adguards"]:
             ad_class = Adguard(url=adguard['hostname'], username=adguard['username'],
-                               password=adguard['password'])
+                               password=adguard['password'], config_records=self.config_records)
 
             if "verify_ssl" in adguard:
                 ad_class.verify_ssl = adguard["verify_ssl"]
 
             self.adguards.append(ad_class)
-
-        for record in configuration["dns_records"]:
-            self.config_records.append(Record(name=record['domain'], address=record['address']))
-
-    def check_dns_records(self, adguard) -> list[list[Record], list[Record]]:
-        """
-        Checks whether a record has to be deleted, edited or created
-
-        :return: two lists of records to be deleted and created
-        """
-        to_be_deleted: list[Record] = []
-        to_be_created: list[Record] = []
-
-        req = re.get(f"{adguard.url}/control/rewrite/list",
-                     auth=(adguard.username, adguard.password), verify=adguard.verify_ssl)
-
-        if req.status_code != 200:
-            logging.error(f"Could not connect to {adguard.url}. Code: {req.status_code}")
-            return [[], []]
-
-        adguard_records: dict[str: str, str: str] = req.json()
-
-        # Check which records are on adguard only. They should get deleted also
-        for adguard_record in adguard_records:
-            record = Record(name=adguard_record["domain"], address=adguard_record["answer"])
-            if record not in self.config_records:
-                self.debug(adguard, f"Record {record.name} not found. Will be deleted...")
-                to_be_deleted.append(record)
-
-
-        for config_record in self.config_records:
-            self.debug(adguard, f"--- Checking {config_record.name}")
-            found = False
-            changed = False
-
-            for adguard_record in adguard_records:
-                if adguard_record["domain"] == config_record.name:
-                    found = True
-                    if adguard_record["answer"] != config_record.address:
-                        self.debug(adguard, f"Need to change {adguard_record['answer']} to "
-                                   f"{config_record.address}")
-                        changed = True
-                        to_be_deleted.append(Record(name=config_record.name, address=adguard_record['answer']))
-                        to_be_created.append(config_record)
-
-                    break
-
-            if found and not changed:
-                self.debug(adguard, "Correct record already exists")
-            elif not found:
-                self.debug(adguard, "Record is missing. Will be created.")
-                to_be_created.append(config_record)
-
-        return [to_be_created, to_be_deleted]
 
     def process(self) -> None:
         """
@@ -191,12 +203,11 @@ class AdguardSync:
         """
         for adguard in self.adguards:
             adguard: Adguard = adguard
-
             self.debug(adguard, f"Starting processing")
+            adguard.start()
 
-            create, delete = self.check_dns_records(adguard)
-            adguard.delete_records(delete)
-            adguard.create_records(create)
+        for adguard in self.adguards:
+            adguard.join()
 
 
 if __name__ == '__main__':
