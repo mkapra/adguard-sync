@@ -1,21 +1,12 @@
 import sys
 import yaml
 import json
+import _thread
 import logging
 import requests as re
 from dataclasses import dataclass, field
 
 logging.basicConfig(level=logging.WARNING)
-
-@dataclass()
-class Adguard:
-    """
-    Instance of adguard
-    """
-    url: str
-    username: str
-    password: str
-    verify_ssl: bool = field(default=True)
 
 
 @dataclass
@@ -29,6 +20,67 @@ class Record:
     address: str
 
 
+class Adguard:
+    """
+    Instance of adguard
+    """
+    url: str
+    username: str
+    password: str
+    verify_ssl: bool = field(default=True)
+
+    def __init__(self, url: str, username: str, password: str, verify_ssl: bool = True):
+        self.url = url
+        self.username = username
+        self.password = password
+        self.verify_ssl = verify_ssl
+
+    def act_on_records(self, records: list[Record], create=True) -> None:
+        """
+        Creates or deletes records.
+
+        :param records: The records that should be created/deleted
+        :param create: Boolean whether the record should be created or deleted
+        """
+        for record in records:
+            record: Record = record
+
+            data = {
+                "domain": record.name,
+                "answer": record.address
+            }
+
+            url = f"{self.url}/control/rewrite/add"
+            if not create:
+                url = f"{self.url}/control/rewrite/delete"
+
+            req = re.post(url, data=json.dumps(data), auth=(self.username, self.password),
+                          verify=self.verify_ssl)
+
+            if req.status_code != 200:
+                action = "create"
+                if not create:
+                    action = "delete"
+
+                logging.warning(f"Unable to {action} DNS record {record.name}: {req.text}")
+
+    def delete_records(self, to_be_deleted: list[Record]) -> None:
+        """
+        Delete records on adguard.
+
+        :param to_be_deleted: The list of records that should be deleted
+        """
+        self.act_on_records(records=to_be_deleted, create=False)
+
+    def create_records(self, to_be_created: list[Record]) -> None:
+        """
+        Create records on adguard.
+
+        :param to_be_created: The list of records that should be created
+        """
+        self.act_on_records(records=to_be_created)
+
+
 class AdguardSync:
     # All adguards
     adguards: list[Adguard] = []
@@ -39,6 +91,10 @@ class AdguardSync:
         configuration = AdguardSync.read_yaml(file_name=file_name)
         self.parse_configuration(configuration=configuration)
         self.process()
+
+    @staticmethod
+    def debug(adguard: Adguard, msg: str):
+        logging.debug(f"[{adguard.url}] {msg}")
 
     @staticmethod
     def read_yaml(file_name: str) -> dict:
@@ -99,12 +155,12 @@ class AdguardSync:
         for adguard_record in adguard_records:
             record = Record(name=adguard_record["domain"], address=adguard_record["answer"])
             if record not in self.config_records:
-                logging.debug(f"Record {record.name} not found. Will be deleted...")
+                self.debug(adguard, f"Record {record.name} not found. Will be deleted...")
                 to_be_deleted.append(record)
 
 
         for config_record in self.config_records:
-            logging.debug(f"--- Checking {config_record.name}")
+            self.debug(adguard, f"--- Checking {config_record.name}")
             found = False
             changed = False
 
@@ -112,8 +168,8 @@ class AdguardSync:
                 if adguard_record["domain"] == config_record.name:
                     found = True
                     if adguard_record["answer"] != config_record.address:
-                        logging.debug(f"Need to change {adguard_record['answer']} to "
-                                      f"{config_record.address}")
+                        self.debug(adguard, f"Need to change {adguard_record['answer']} to "
+                                   f"{config_record.address}")
                         changed = True
                         to_be_deleted.append(Record(name=config_record.name, address=adguard_record['answer']))
                         to_be_created.append(config_record)
@@ -121,61 +177,12 @@ class AdguardSync:
                     break
 
             if found and not changed:
-                logging.debug("Correct record already exists")
+                self.debug(adguard, "Correct record already exists")
             elif not found:
-                logging.debug("Record is missing. Will be created.")
+                self.debug(adguard, "Record is missing. Will be created.")
                 to_be_created.append(config_record)
 
         return [to_be_created, to_be_deleted]
-
-    @staticmethod
-    def act_on_records(adguard: Adguard, records: list[Record], create=True) -> None:
-        """
-        Creates or deletes records.
-
-        :param adguard: The adguard to act on
-        :param records: The records that should be created/deleted
-        :param create: Boolean whether the record should be created or deleted
-        """
-        for record in records:
-            record: Record = record
-
-            data = {
-                "domain": record.name,
-                "answer": record.address
-            }
-
-            url = f"{adguard.url}/control/rewrite/add"
-            if not create:
-                url = f"{adguard.url}/control/rewrite/delete"
-
-            req = re.post(url, data=json.dumps(data), auth=(adguard.username, adguard.password),
-                          verify=adguard.verify_ssl)
-
-            if req.status_code != 200:
-                action = "create"
-                if not create:
-                    action = "delete"
-
-                logging.warning(f"Unable to {action} DNS record {record.name}: {req.text}")
-
-    def delete_records(self, adguard: Adguard, to_be_deleted: list[Record]) -> None:
-        """
-        Delete records on adguard.
-
-        :param adguard: The adguard to act on
-        :param to_be_deleted: The list of records that should be deleted
-        """
-        self.act_on_records(adguard=adguard, records=to_be_deleted, create=False)
-
-    def create_records(self, adguard: Adguard, to_be_created: list[Record]) -> None:
-        """
-        Create records on adguard.
-
-        :param adguard: The adguard to act on
-        :param to_be_created: The list of records that should be created
-        """
-        self.act_on_records(adguard=adguard, records=to_be_created)
 
     def process(self) -> None:
         """
@@ -185,11 +192,11 @@ class AdguardSync:
         for adguard in self.adguards:
             adguard: Adguard = adguard
 
-            logging.debug(f"{'-' * 15} {adguard.url}")
-            create, delete = self.check_dns_records(adguard)
+            self.debug(adguard, f"Starting processing")
 
-            self.delete_records(adguard, delete)
-            self.create_records(adguard, create)
+            create, delete = self.check_dns_records(adguard)
+            adguard.delete_records(delete)
+            adguard.create_records(create)
 
 
 if __name__ == '__main__':
